@@ -1,0 +1,9 @@
+{
+  "sd_address": "224.224.224.245",
+  "sd_port": 30490,
+  "log_level": "DEBUG",
+  "interface": "192.168.1.10",
+  "use_tcp": true,
+  "tcp_host": "127.0.0.1",
+  "tcp_port": 30500
+}
