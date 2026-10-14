@@ -305,9 +305,22 @@ class MainWindow(QMainWindow):
     def _insert_row(self, values, row_key=None):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        row_type = self._text(values[1]).upper() if len(values) > 1 else ""
+        if row_type == "SOME/IP-SD":
+            row_background = QColor("#FFF4D6")  # warm pale yellow for SD
+            row_foreground = QColor("#754C00")
+        elif row_type == "SOME/IP":
+            row_background = QColor("#E8F2FF")  # pale blue for SOME/IP messages
+            row_foreground = QColor("#173B68")
+        else:
+            row_background = QColor("#FFFFFF")
+            row_foreground = QColor("#202124")
+
         for col, value in enumerate(values):
             item = QTableWidgetItem(self._text(value))
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            item.setBackground(row_background)
+            item.setForeground(row_foreground)
             if col == 0:
                 item.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, col, item)
@@ -325,6 +338,14 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.table.setItem(row, col, item)
         item.setText(self._text(value))
+        row_type_item = self.table.item(row, 1)
+        row_type = row_type_item.text().upper() if row_type_item else ""
+        if row_type == "SOME/IP-SD":
+            item.setBackground(QColor("#FFF4D6"))
+            item.setForeground(QColor("#754C00"))
+        elif row_type == "SOME/IP":
+            item.setBackground(QColor("#E8F2FF"))
+            item.setForeground(QColor("#173B68"))
 
     def _trim_table(self):
         while self.table.rowCount() > MAX_ROWS:
