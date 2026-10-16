@@ -1,80 +1,211 @@
-# SOME/IP Monitor — SBC Agent + PC GUI
+# SOME/IP Monitor & Detailed Protocol Analyzer
 
-Starter project for monitoring SOME/IP and SOME/IP-SD traffic from an SBC and viewing it on a PC.
+A complete, high-performance tooling suite for capturing, dissecting, and analyzing **AUTOSAR SOME/IP** and **SOME/IP-SD** traffic across embedded targets (**Linux** and **QNX Neutrino RTOS 7.x / 8.0**) and monitoring on a PC.
 
-## Components
+---
 
-- `sbc_agent/`: C++17 UDP telemetry/control agent with packet-capture abstraction.
-- `pc_monitor/`: Python/PySide6 GUI.
-- Packet capture currently uses **libpcap**. QNX SDP 8.0 has pcap-related packages, but you must verify that the pcap headers/library are installed in your host SDP and that the package is included in the target image. If not, implement the `CaptureBackend` using QNX io-sock BPF (`/dev/bpf`) as a separate backend.
-- The SOME/IP parser handles Ethernet + IPv4 + UDP/TCP packets and decodes basic SOME/IP-SD entries (OfferService, FindService, SubscribeEventgroup, SubscribeEventgroupAck). This is an MVP, not a complete AUTOSAR-compliant dissector.
+## Architecture Overview
 
-## Network ports
+```
++--------------------------------------------------------------+
+|                     Target SBC / ECU                         |
+|  +--------------------------------------------------------+  |
+|  |                 sbc_agent (C++17)                      |  |
+|  |                                                        |  |
+|  |  +---------------------+      +---------------------+  |  |
+|  |  |  PcapCaptureBackend |      | QnxBpfCaptureBackend|  |  |
+|  |  |   (Linux / QNX)     |      |  (Native QNX /dev/bpf) |  |
+|  |  +----------+----------+      +----------+----------+  |  |
+|  |             \                            /             |  |
+|  |              +------------+-------------+              |  |
+|  |                           |                            |  |
+|  |             +-------------v-------------+              |  |
+|  |             |      SomeIpDissector      |              |  |
+|  |             |  - Header / TP / SD / VLAN|              |  |
+|  |             +-------------+-------------+              |  |
+|  |                           |                            |  |
+|  |                           v                            |  |
+|  |            Control Port (UDP 47000)                    |  |
+|  |            Telemetry Port (UDP 47001)                  |  |
+|  +---------------------------+----------------------------+  |
++------------------------------|-------------------------------+
+                               | Rich JSON Telemetry
+                               v
++--------------------------------------------------------------+
+|                       Host PC Monitor                        |
+|  +--------------------------------------------------------+  |
+|  |                 pc_monitor (Python/PySide6)            |  |
+|  |                                                        |  |
+|  |  - Wireshark-Grade Packet Dissection Tree              |  |
+|  |  - Hex Dump & Payload Data Type Interpretations        |  |
+|  |  - Discovered Services Catalog (TTL countdown)         |  |
+|  |  - Eventgroup Subscriptions Tracker                    |  |
+|  |  - Live KPIs & Throughput Statistics                   |  |
+|  |  - Search, Service/Method Filter & JSON Export         |  |
+|  |                                                        |  |
+|  |  +--------------------------------------------------+  |  |
+|  |  | someip_decoder.py (Standalone Decoder Engine)    |  |  |
+|  |  +--------------------------------------------------+  |  |
+|  +--------------------------------------------------------+  |
++--------------------------------------------------------------+
+```
 
-- PC -> SBC control: UDP 47000
-- SBC -> PC telemetry: UDP 47001
-- SOME/IP-SD default destination port: 30490 (configurable through source code for now)
+---
 
-The PC IP is configured when starting the agent.
+## Detailed Protocol Analysis Capabilities
 
-## Linux build (host or SBC)
+Both the C++ agent and Python tools provide full dissection according to the **AUTOSAR SOME/IP & SOME/IP-SD** specifications:
 
-Dependencies:
-- C++17 compiler
-- CMake 3.16+
-- libpcap development headers/library
+### 1. SOME/IP Protocol Dissection
+- **Message ID (32-bit)**:
+  - **Service ID (16-bit)** (e.g. `0x1234`)
+  - **Method ID / Event ID (16-bit)**: Distinguishes between Method (bit 15 = 0) and Event (bit 15 = 1).
+- **Length Field (32-bit)**: Total length of payload starting from Client ID.
+- **Request ID (32-bit)**:
+  - **Client ID (16-bit)**
+  - **Session ID (16-bit)**
+- **Protocol Version (8-bit)** & **Interface Version (8-bit)**
+- **Message Types (8-bit)**:
+  - `REQUEST (0x00)`, `REQUEST_NO_RETURN (0x01)`, `NOTIFICATION (0x02)`, `RESPONSE (0x80)`, `ERROR (0x81)`
+  - Transport Protocol segmented messages: `TP_REQUEST (0x20)`, `TP_NOTIFICATION (0x22)`, `TP_RESPONSE (0x23)`, etc.
+- **Return Codes (8-bit)**:
+  - `E_OK (0x00)`, `E_NOT_OK (0x01)`, `E_UNKNOWN_SERVICE (0x02)`, `E_UNKNOWN_METHOD (0x03)`, `E_NOT_READY (0x04)`, `E_NOT_REACHABLE (0x05)`, `E_TIMEOUT (0x06)`, etc.
+- **SOME/IP-TP (Transport Protocol) Header (4-byte)**:
+  - Offset in bytes (`offset_field * 16`)
+  - More Segments flag (`True` / `False`)
+- **Multi-PDU Unwrapping**: Handles multiple SOME/IP messages inside a single UDP packet or TCP segment.
+- **Link Layer**: Supports standard Ethernet II and **802.1Q VLAN tagged frames**.
 
+### 2. SOME/IP-SD (Service Discovery) Dissection
+- **SD Header**:
+  - Flags: **Reboot flag**, **Unicast flag**, Explicit initial data control.
+- **Entries**:
+  - `FindService (0x00)`
+  - `OfferService (0x01)` (TTL > 0 = Offer, TTL == 0 = StopOfferService)
+  - `SubscribeEventgroup (0x06)` (TTL > 0 = Subscribe, TTL == 0 = StopSubscribeEventgroup)
+  - `SubscribeEventgroupAck (0x07)` (TTL > 0 = Ack, TTL == 0 = Nack)
+  - Minor Version (Service entries) & Eventgroup ID, Counter, Initial Data Requested (Eventgroup entries)
+- **Options**:
+  - `IPV4_ENDPOINT (0x04)`: IPv4 Address, Protocol (UDP/TCP), Port
+  - `IPV6_ENDPOINT (0x06)`: IPv6 Address, Protocol, Port
+  - `IPV4_MULTICAST (0x14)`, `IPV6_MULTICAST (0x16)`
+  - `CONFIGURATION (0x01)`: Configuration key/value strings
+- **Entry-to-Option Resolution**: Automatically links each entry to its referenced endpoints.
+
+---
+
+## SBC Agent: Linux & QNX Neutrino RTOS Support
+
+The C++ agent (`sbc_agent`) features a pluggable capture backend architecture (`ICaptureBackend`):
+1. **`PcapCaptureBackend`**: Uses `libpcap` on Linux and QNX (when pcap is present).
+2. **`QnxBpfCaptureBackend`**: Native QNX BSD Packet Filter (`/dev/bpf`) backend. Operates directly on QNX `io-sock` without requiring any external libraries!
+
+### Linux Build (Host or SBC)
+You can use the helper script or CMake directly:
+```bash
+# Using the build script (from root or sbc_agent):
+./build_linux.sh
+
+# Or with options:
+./build_linux.sh --clean --build-type Release -j 8
+
+# Run the agent:
+sudo ./sbc_agent/build/someip_agent --iface eth0 --pc-ip 192.168.1.10
+```
+
+### QNX Neutrino RTOS Build (SDP 7.0 / 7.1 / 8.0)
+A dedicated QNX toolchain file is included at `sbc_agent/cmake/qnx_nto_toolchain.cmake`.
+
+Using the automated build script:
+```bash
+# 1. Source your QNX SDP environment (or pass --sdp-path):
+source /opt/qnx710/qnxsdp-env.sh
+
+# 2. Build for aarch64 (or x86_64 / armv7):
+./build_qnx.sh --arch aarch64
+
+# Or specify SDP path directly:
+./build_qnx.sh --arch aarch64 --sdp-path /opt/qnx710
+
+# 3. Transfer binary to QNX target and run:
+scp sbc_agent/build_qnx_aarch64/someip_agent qnx-target:/tmp/
+# On QNX target (using native /dev/bpf capture):
+/tmp/someip_agent --iface dmfe0 --pc-ip <PC_IP> --backend bpf
+```
+
+### SBC Agent Command-Line Options
+```
+Usage: someip_agent [options]
+
+Options:
+  --iface <iface>          Network interface to monitor (default: eth0)
+  --pc-ip <ip>             IP address of monitoring PC (default: 192.168.1.10)
+  --control-port <port>    UDP port for incoming control commands (default: 47000)
+  --telemetry-port <port>  UDP port for telemetry stream to PC (default: 47001)
+  --backend <auto|pcap|bpf> Capture backend (default: auto)
+  --preview-len <bytes>    Max payload bytes previewed in hex (default: 256)
+  --help                   Display this help message
+```
+
+---
+
+## PC Monitor GUI
+
+### Run the GUI
+```bash
+# Activate virtual environment if desired:
+python -m pip install PySide6
+python pc_monitor/main.py
+```
+
+### Key Features
+1. **Live Packets & Dissection Tab**:
+   - **Packets Table**: Displays all captured frames with color-coding (Gold for SD, Green for Notifications, Blue for Requests/Responses, Red for Errors).
+   - **Packet Dissection Details**: Collapsible tree inspector detailing Frame, SOME/IP Header, SOME/IP-TP segments, and SOME/IP-SD flags/entries/options.
+   - **Hex Dump & ASCII View**: Monospace formatted hex view with byte offsets.
+   - **Payload Data Interpreter**: Automatically decodes payload bytes as `Uint8/16/32/64`, `Int8/16/32`, `Float32/64`, ASCII strings, and sensor patterns (e.g. `>If` counter + temperature).
+2. **Discovered Services Catalog Tab**:
+   - Live table of offered services, instance IDs, major/minor versions, resolved endpoint IP:Port, transport protocol, and active TTL countdown.
+3. **Eventgroups & Subscriptions Tab**:
+   - Tracks active eventgroup subscriptions, subscriber IP:Port, and acknowledgment state.
+4. **Statistics & Metrics Tab**:
+   - Real-time KPIs for total packets, message types, error counts, and packet rates (pkts/sec).
+5. **Real-Time Filtering & Search**:
+   - Filter by keyword, Service ID (e.g. `0x1234`), Method ID, or Message Type dropdown.
+   - Pause view and Auto-scroll toggles.
+6. **Export**:
+   - Export captured packet sessions to timestamped JSON files for offline analysis.
+
+---
+
+## Standalone Python Decoder Module (`someip_decoder.py`)
+
+Can be used in custom automation scripts, CI/CD, or offline PCAP parsers:
+```python
+from pc_monitor.someip_decoder import decode_someip, format_hex_dump, interpret_payload
+
+raw_bytes = bytes.fromhex("123400010000001000010042010100000000002a41bc0000")
+messages = decode_someip(raw_bytes)
+
+for msg in messages:
+    print(f"Service: 0x{msg.header.service_id:04X}, Method: 0x{msg.header.method_id:04X}")
+    print(f"Type: {msg.header.message_type.name}, Return Code: {msg.header.return_code.name}")
+    print("Hex dump:\n" + format_hex_dump(msg.payload))
+    print("Interpreted fields:", interpret_payload(msg.payload))
+```
+
+---
+
+## Running the Automated Test Suites
+
+### C++ Dissector Tests
 ```bash
 cd sbc_agent
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-sudo ./build/someip_agent --iface eth0 --pc-ip 192.168.1.5
+g++ -std=c++17 -Wall -Wextra -I include src/someip/someip_dissector.cpp tests/test_dissector.cpp -o test_dissector
+./test_dissector
 ```
 
-Use `--iface` for your interface (e.g. `eth0`, `enp1s0`). Capture generally requires root or appropriate packet-capture capabilities.
-
-## QNX SDP 8.0 notes
-
-1. Verify the pcap headers and library in your installed SDP and target image.
-2. Build with the QNX aarch64 toolchain configured in your environment. For example, if that variant exists:
-   ```bash
-   q++ -Vgcc_ntoaarch64le_cxx ...
-   ```
-   Prefer a CMake toolchain file configured for your actual SDP installation.
-3. Ensure the target has the relevant io-sock networking stack, interface driver, and permissions for packet capture.
-4. If pcap is unavailable, do not assume Linux `AF_PACKET` works on QNX. Add a QNX-specific BPF backend using the documented `/dev/bpf` interface and ioctls.
-5. Do not claim QNX compilation success until you build and run it on your installed SDP/target.
-
-## Run the GUI
-
+### Python Unit Tests
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install PySide6
-python3 pc_monitor/main.py
+python -m unittest tests/test_someip_decoder.py
 ```
-
-In the GUI, set the PC IP that the SBC can reach, then click **Start agent listener**. Start the SBC agent with the same PC IP. Send `START` or `STOP` commands from the GUI.
-
-## Control protocol
-
-Commands are plain UTF-8 UDP datagrams:
-- `START`
-- `STOP`
-- `GET_STATUS`
-- `GET_SERVICES`
-- `SET_FILTER <pcap-filter-expression>`
-
-The GUI sends commands to the SBC control port. Telemetry datagrams are JSON objects:
-- `{"type":"status", ...}`
-- `{"type":"packet", ...}`
-- `{"type":"service", ...}`
-- `{"type":"sd", ...}`
-
-## Limitations / next steps
-
-- Capture is local to the SBC interface. A PC connected to an ordinary switch will not necessarily see unicast packets between two other devices.
-- Current service tracking is an MVP; TTL expiry is applied when processing SD packets, not by a periodic expiry timer.
-- TCP payload reassembly is not implemented. TCP packets are decoded only when a complete SOME/IP message is present in one captured segment.
-- IPv6, VLAN-tagged Ethernet, SOME/IP-TP segmentation, malformed-packet hardening, and full AUTOSAR SD option parsing need further implementation.
-- This project is a starting implementation and should be tested with real traffic before being used for debugging or production.
