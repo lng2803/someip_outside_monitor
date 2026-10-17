@@ -151,12 +151,22 @@ Options:
 
 ## PC Monitor GUI
 
+![SOME/IP Monitor UI](assets/ui.png)
+
 ### Run the GUI
 ```bash
 # Activate virtual environment if desired:
 python -m pip install PySide6
 python pc_monitor/main.py
 ```
+
+### Build Windows Executable (.exe)
+You can build a standalone Windows `.exe` using PyInstaller and the provided spec file:
+```cmd
+pip install pyinstaller PySide6
+build_windows.bat
+```
+The output executable will be generated at `dist/SomeipMonitor/SomeipMonitor.exe`.
 
 ### Key Features
 1. **Live Packets & Dissection Tab**:
@@ -171,10 +181,11 @@ python pc_monitor/main.py
 4. **Statistics & Metrics Tab**:
    - Real-time KPIs for total packets, message types, error counts, and packet rates (pkts/sec).
 5. **Real-Time Filtering & Search**:
-   - Filter by keyword, Service ID (e.g. `0x1234`), Method ID, or Message Type dropdown.
+   - Filter by keyword, Service ID (e.g. `0x1234`), Method ID, or Message Type dropdown (`SOME/IP Only`, `SOME/IP-SD Only`, `REQUEST`, `RESPONSE`, `NOTIFICATION`, `ERRORS`).
    - Pause view and Auto-scroll toggles.
-6. **Export**:
-   - Export captured packet sessions to timestamped JSON files for offline analysis.
+6. **Export & Import JSON**:
+   - **Export JSON**: Export captured packet sessions to timestamped JSON files for offline analysis and playback.
+   - **Import JSON**: Load previously captured JSON files into the monitor to inspect packets, services, and statistics offline.
 
 ---
 

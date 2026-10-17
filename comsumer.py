@@ -70,7 +70,7 @@ async def main():
     )
 
     client.register_callback(on_event)
-    client.subscribe_eventgroup(event_group, 5)
+    client.subscribe_eventgroup(event_group, 100)
 
     print(f"Subscribed to service 0x{SERVICE_ID:04X}")
     print("Waiting for SOME/IP events...")

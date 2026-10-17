@@ -42,7 +42,7 @@ except ImportError:
     )
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -73,6 +73,21 @@ from PySide6.QtWidgets import (
 CONTROL_PORT = 47000
 TELEMETRY_PORT = 47001
 MAX_ROWS = 5000
+
+
+def _get_asset_path(relative_path: str) -> str:
+    """Return the absolute path to an asset file.
+
+    Works both when running from source and when bundled with PyInstaller
+    (where ``sys._MEIPASS`` points to the temporary extraction directory).
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS  # type: ignore[attr-defined]
+    else:
+        # Running from source: assets/ lives two levels up from this file
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative_path)
+
 
 WHITE_STYLESHEET = """
 QWidget {
@@ -296,8 +311,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SOME/IP Detailed Protocol Analyzer & Monitor")
+        self.setWindowIcon(QIcon(_get_asset_path(os.path.join("assets", "icon.ico"))))
         self.resize(1500, 880)
         self.setStyleSheet(WHITE_STYLESHEET)
+
 
         self.worker = TelemetryWorker()
         self.worker.message.connect(self.handle_message)
@@ -382,6 +399,10 @@ class MainWindow(QMainWindow):
         export_btn = QPushButton("Export JSON")
         export_btn.clicked.connect(self.export_packets)
         ctrl_layout.addWidget(export_btn)
+
+        import_btn = QPushButton("Import JSON")
+        import_btn.clicked.connect(self.import_packets)
+        ctrl_layout.addWidget(import_btn)
 
         main_layout.addWidget(ctrl_frame)
 
@@ -661,6 +682,88 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.log(f"Export failed: {exc}")
             QMessageBox.critical(self, "Export Failed", str(exc))
+
+    def import_packets(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Captured Packets JSON", "", "JSON Files (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if isinstance(data, dict):
+                packets = data.get("packets", []) if "packets" in data else [data]
+            elif isinstance(data, list):
+                packets = [p for p in data if isinstance(p, dict)]
+            else:
+                raise ValueError("JSON file root must be a list of packets or a packet object.")
+
+            if not packets:
+                QMessageBox.information(self, "Import", "No valid packet records found in file.")
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "Import Options",
+                f"Found {len(packets)} packets to import.\n\n"
+                "Clear current packets and catalog before importing?\n"
+                "(Choose 'Yes' to replace existing data, 'No' to append)",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Cancel:
+                return
+
+            if reply == QMessageBox.Yes:
+                self.clear_all()
+                self.services_catalog.clear()
+                self.subscriptions_catalog.clear()
+                self._refresh_services_table()
+                self._refresh_subscriptions_table()
+
+            # Pause autoscroll/view temporarily to speed up batch insertion
+            self.table.setUpdatesEnabled(False)
+            try:
+                for pkt in packets:
+                    self.total_packets_count += 1
+                    pkt_data = dict(pkt)
+                    if "_id" not in pkt_data:
+                        pkt_data["_id"] = self.total_packets_count
+                    if "_rx_time" not in pkt_data:
+                        pkt_data["_rx_time"] = time.strftime("%H:%M:%S")
+
+                    proto = str(pkt_data.get("protocol", "")).upper()
+                    m_type = str(pkt_data.get("type", "")).lower()
+                    is_sd = (m_type == "sd_packet") or (proto == "SOME/IP-SD")
+
+                    if is_sd:
+                        self.sd_count += 1
+                        self._handle_sd_telemetry(pkt_data)
+                    else:
+                        self.someip_count += 1
+                        self._handle_someip_telemetry(pkt_data)
+
+                    self.packets_data.append(pkt_data)
+                    if len(self.packets_data) > MAX_ROWS:
+                        self.packets_data.pop(0)
+
+                    self._insert_packet_row(pkt_data)
+            finally:
+                self.table.setUpdatesEnabled(True)
+
+            self._apply_table_filters()
+            self._update_stats_display()
+
+            self.log(f"Imported {len(packets)} packets from {path}")
+            QMessageBox.information(
+                self,
+                "Import Successful",
+                f"Successfully imported {len(packets)} packets from:\n{path}",
+            )
+        except Exception as exc:
+            self.log(f"Import failed: {exc}")
+            QMessageBox.critical(self, "Import Failed", f"Failed to import JSON file:\n{exc}")
+
 
     def _periodic_check(self):
         now = time.time()
@@ -982,54 +1085,68 @@ class MainWindow(QMainWindow):
         if self.chk_autoscroll.isChecked():
             self.table.scrollToBottom()
 
-    def _apply_table_filters(self):
+        # Apply the active filters to the newly inserted row so live packets
+        # obey whatever filter is currently selected.
+        if not self._row_passes_filters(row):
+            self.table.setRowHidden(row, True)
+
+    def _row_passes_filters(self, row: int) -> bool:
+        """Return True if *row* should be visible given the current filter state.
+
+        Shared by ``_apply_table_filters`` (bulk scan) and
+        ``_insert_packet_row`` (per-row check on new arrivals).
+        """
         query = self.search_input.text().strip().lower()
         filter_svc = self.filter_service.text().strip().lower()
         filter_type = self.filter_type_combo.currentText()
 
+        # Text search filter
+        if query:
+            row_text = " ".join(
+                self.table.item(row, col).text().lower()
+                for col in range(self.table.columnCount())
+                if self.table.item(row, col)
+            )
+            if query not in row_text:
+                return False
+
+        # Service ID filter (col 6)
+        if filter_svc:
+            svc_item = self.table.item(row, 6)
+            if svc_item and filter_svc not in svc_item.text().lower():
+                return False
+
+        # Type combo filter
+        if filter_type != "All Types":
+            proto_item = self.table.item(row, 2)   # "Type" column  → protocol
+            type_item  = self.table.item(row, 8)   # "Message Type" → msg_type_name
+            ret_item   = self.table.item(row, 9)   # "Return Code"  → return_code_name
+
+            proto_text = proto_item.text() if proto_item else ""
+            type_text  = type_item.text()  if type_item  else ""
+            # Normalise to uppercase so "0x00" and "0X00" both match
+            ret_text   = ret_item.text().upper() if ret_item else ""
+
+            if filter_type == "SOME/IP Only" and "SOME/IP-SD" in proto_text:
+                return False
+            elif filter_type == "SOME/IP-SD Only" and "SOME/IP-SD" not in proto_text:
+                return False
+            elif filter_type == "REQUEST" and "REQUEST" not in type_text.upper():
+                return False
+            elif filter_type == "RESPONSE" and "RESPONSE" not in type_text.upper():
+                return False
+            elif filter_type == "NOTIFICATION" and "NOTIFICATION" not in type_text.upper():
+                return False
+            elif filter_type == "ERRORS" and ret_text in ("E_OK", "0X00", "0"):
+                # Hide rows where return code indicates *no* error
+                return False
+
+        return True
+
+    def _apply_table_filters(self):
+        """Re-evaluate visibility for every row in the table."""
         for row in range(self.table.rowCount()):
-            show = True
-
-            # Text search filter
-            if query:
-                row_text = " ".join(
-                    self.table.item(row, col).text().lower()
-                    for col in range(self.table.columnCount())
-                    if self.table.item(row, col)
-                )
-                if query not in row_text:
-                    show = False
-
-            # Service ID filter
-            if show and filter_svc:
-                svc_item = self.table.item(row, 6)
-                if svc_item and filter_svc not in svc_item.text().lower():
-                    show = False
-
-            # Type combo filter
-            if show and filter_type != "All Types":
-                proto_item = self.table.item(row, 2)
-                type_item = self.table.item(row, 8)
-                ret_item = self.table.item(row, 9)
-
-                proto_text = proto_item.text() if proto_item else ""
-                type_text = type_item.text() if type_item else ""
-                ret_text = ret_item.text() if ret_item else ""
-
-                if filter_type == "SOME/IP Only" and "SOME/IP-SD" in proto_text:
-                    show = False
-                elif filter_type == "SOME/IP-SD Only" and "SOME/IP-SD" not in proto_text:
-                    show = False
-                elif filter_type == "REQUEST" and "REQUEST" not in type_text.upper():
-                    show = False
-                elif filter_type == "RESPONSE" and "RESPONSE" not in type_text.upper():
-                    show = False
-                elif filter_type == "NOTIFICATION" and "NOTIFICATION" not in type_text.upper():
-                    show = False
-                elif filter_type == "ERRORS" and ret_text in ("E_OK", "0X00", "0"):
-                    show = False
-
-            self.table.setRowHidden(row, not show)
+            self.table.setRowHidden(row, not self._row_passes_filters(row))
 
     def _on_packet_selected(self):
         selected_rows = self.table.selectionModel().selectedRows()
@@ -1187,6 +1304,7 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(WHITE_STYLESHEET)
+    app.setWindowIcon(QIcon(_get_asset_path(os.path.join("assets", "icon.ico"))))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
